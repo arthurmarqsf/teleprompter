@@ -77,6 +77,13 @@
       applyOpacity();
     });
 
+    el.fps30 = $('cam-fps30');
+    el.fps30.checked = fps.on;
+    el.fps30.addEventListener('change', function () {
+      fps.on = el.fps30.checked; save('tp_cam_fps30', fps.on ? '1' : '0');
+      if (!fps.on && fps.manual) { setAutoExposure().then(showInfo); }
+    });
+
     el.panel.addEventListener('keydown', function (e) { e.stopPropagation(); });
 
     window.addEventListener('beforeunload', function (e) {
@@ -162,6 +169,7 @@
   }
 
   function startCamera() {
+    stopFpsLoop();
     stopTracks();
     el.info.textContent = 'Abrindo câmera…';
 
@@ -179,6 +187,7 @@
       return el.video.play();
     }).then(function () {
       showInfo();
+      startFpsLoop();
     }).catch(function (err) {
       alert('Não foi possível abrir a câmera: ' + (err && err.message ? err.message : err) +
         '\n\nPermita o acesso à câmera e ao microfone para este app.');
@@ -202,10 +211,96 @@
     txt += a ? ' · 🎤 ' + (as.sampleRate ? Math.round(as.sampleRate / 1000) + 'kHz' : 'ok') : ' · sem microfone';
     if (state.res === '4k' && Math.min(w, h) < 2160) { txt += ' (4K não disponível nesta câmera)'; }
     if ((s.frameRate || 30) < 25) { txt += ' · fps baixo: use "Máxima" para 30fps'; }
+    if (fps.manual) { txt += ' · 30fps fixo (pouca luz)'; }
     el.info.textContent = txt;
   }
 
+  /**
+   * 30 fps fixo: em pouca luz o automático alonga a exposição e o vídeo cai para 13–20 fps.
+   * Aqui fixamos a exposição em 1/30 s e ajustamos o ISO medindo o brilho real da imagem.
+   */
+  var fps = { on: load('tp_cam_fps30', '1') === '1', manual: false, target: 0, iso: 400, timer: null, busy: false };
+
+  function frameLuma() {
+    try {
+      var c = fps.canvas || (fps.canvas = document.createElement('canvas'));
+      c.width = 64; c.height = 36;
+      var g = c.getContext('2d', { willReadFrequently: true });
+      g.drawImage(el.video, 0, 0, 64, 36);
+      var d = g.getImageData(0, 0, 64, 36).data, s = 0;
+      for (var i = 0; i < d.length; i += 4) { s += (d[i] + d[i + 1] + d[i + 2]) / 3; }
+      return s / (d.length / 4);
+    } catch (e) { return 0; }
+  }
+
+  function measureFps(ms) {
+    return new Promise(function (resolve) {
+      var v = el.video;
+      if (!v.requestVideoFrameCallback) { resolve(30); return; }
+      var n = 0, t0 = performance.now();
+      function f() { n++; if (performance.now() - t0 < ms) { v.requestVideoFrameCallback(f); } else { resolve(n * 1000 / ms); } }
+      v.requestVideoFrameCallback(f);
+    });
+  }
+
+  function videoTrack() { return state.stream && state.stream.getVideoTracks()[0]; }
+
+  function setAutoExposure() {
+    var t = videoTrack();
+    fps.manual = false;
+    if (t) { return t.applyConstraints({ advanced: [{ exposureMode: 'continuous' }] }).catch(function () {}); }
+    return Promise.resolve();
+  }
+
+  function fpsStep() {
+    var t = videoTrack();
+    if (!t || fps.busy || !fps.on || el.video.readyState < 2) { return; }
+    var caps = t.getCapabilities ? t.getCapabilities() : {};
+    if (!caps.exposureTime || !caps.iso || !caps.exposureMode || caps.exposureMode.indexOf('manual') === -1) { return; }
+    var s = t.getSettings();
+    if ((s.frameRate || 30) < 29) { return; } // modo de alta resolução: câmera não chega a 30
+
+    fps.busy = true;
+    var p;
+    if (!fps.manual) {
+      p = measureFps(1000).then(function (real) {
+        if (real >= 26) { return; }
+        fps.target = frameLuma();
+        fps.iso = Math.min(caps.iso.max, Math.max(caps.iso.min, 800));
+        fps.manual = true;
+        return t.applyConstraints({ advanced: [{ exposureMode: 'manual', exposureTime: 330, iso: Math.round(fps.iso) }] });
+      });
+    } else {
+      var l = frameLuma();
+      if (l > 0 && fps.target > 0) {
+        if (fps.iso <= caps.iso.min + 1 && l > fps.target * 1.15) {
+          // ficou claro: volta ao automático
+          p = setAutoExposure();
+        } else if (Math.abs(l - fps.target) > fps.target * 0.05) {
+          var k = Math.min(1.6, Math.max(0.6, fps.target / Math.max(l, 2)));
+          fps.iso = Math.min(caps.iso.max, Math.max(caps.iso.min, fps.iso * k));
+          p = t.applyConstraints({ advanced: [{ exposureMode: 'manual', exposureTime: 330, iso: Math.round(fps.iso) }] });
+        }
+      }
+    }
+    Promise.resolve(p).catch(function () {}).then(function () {
+      fps.busy = false;
+      showInfo();
+    });
+  }
+
+  function startFpsLoop() {
+    stopFpsLoop();
+    fps.manual = false;
+    fps.timer = setInterval(fpsStep, 700);
+  }
+
+  function stopFpsLoop() {
+    if (fps.timer) { clearInterval(fps.timer); fps.timer = null; }
+  }
+
   function stopCamera() {
+    stopFpsLoop();
     if (state.recorder) { stopRecording(); }
     stopTracks();
     el.video.srcObject = null;
@@ -388,7 +483,7 @@
   }
 
   // Expõe estado para diagnóstico
-  window.TPCam = { state: state, start: startCamera, stop: stopCamera, rec: startRecording, stopRec: stopRecording };
+  window.TPCam = { state: state, fps: fps, start: startCamera, stop: stopCamera, rec: startRecording, stopRec: stopRecording };
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
