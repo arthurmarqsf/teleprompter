@@ -1,5 +1,5 @@
 // Cache para funcionar offline no tablet (precache + cache em tempo de execução)
-var cacheName = 'tp-v4';
+var cacheName = 'tp-v5';
 var precache = [
   './',
   './index.html',
@@ -40,7 +40,7 @@ self.addEventListener('fetch', function(event) {
   if (url.indexOf('socket.io') !== -1) { return; }
   // Rede primeiro (pega atualizações na hora); sem internet usa o cache
   event.respondWith(
-    fetch(event.request).then(function(response) {
+    fetch(event.request, { cache: 'no-cache' }).then(function(response) {
       if (response && (response.ok || response.type === 'opaque')) {
         var copy = response.clone();
         caches.open(cacheName).then(function(cache) { cache.put(event.request, copy); });
