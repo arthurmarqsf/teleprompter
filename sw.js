@@ -1,5 +1,5 @@
 // Cache para funcionar offline no tablet (precache + cache em tempo de execução)
-var cacheName = 'tp-v2';
+var cacheName = 'tp-v3';
 var precache = [
   './',
   './index.html',
@@ -9,6 +9,7 @@ var precache = [
   './assets/css/font-awesome.min.css',
   './assets/js/plugins.v122.js',
   './assets/js/script.v122.js',
+  './assets/js/camera.js',
   './assets/font/fontawesome-webfont.woff',
   './assets/img/icon-192x192.png',
   './assets/img/icon-512x512.png',
