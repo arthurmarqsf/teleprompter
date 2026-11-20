@@ -10,7 +10,7 @@
 
   var MODES = {
     'max':   { label: 'Máxima', list: [[3840, 2160], [2560, 1440], [1920, 1080], [1280, 720]], minFps: 24 },
-    '4k':    { label: '4K',     list: [[3840, 2160]], minFps: 0 },
+    '4k':    { label: 'Máx. resolução', list: [[3840, 2160], [3264, 1836], [2880, 1620], [2560, 1440]], minFps: 0 },
     '1440p': { label: '1440p',  list: [[2560, 1440]], minFps: 0 },
     '1080p': { label: '1080p',  list: [[1920, 1080]], minFps: 0 },
     '720p':  { label: '720p',   list: [[1280, 720]],  minFps: 0 }
@@ -200,7 +200,8 @@
     state.settings = { w: w, h: h, fps: s.frameRate || 30 };
     var txt = qualityName(w, h) + ' · ' + w + '×' + h + ' · ' + Math.round(s.frameRate || 30) + 'fps';
     txt += a ? ' · 🎤 ' + (as.sampleRate ? Math.round(as.sampleRate / 1000) + 'kHz' : 'ok') : ' · sem microfone';
-    if (state.res === '4k' && Math.min(w, h) < 2160) { txt += ' (esta câmera não faz 4K)'; }
+    if (state.res === '4k' && Math.min(w, h) < 2160) { txt += ' (4K não disponível nesta câmera)'; }
+    if ((s.frameRate || 30) < 25) { txt += ' · fps baixo: use "Máxima" para 30fps'; }
     el.info.textContent = txt;
   }
 
@@ -233,9 +234,9 @@
 
   function videoBitrate() {
     var st = state.settings || { w: 1920, h: 1080, fps: 30 };
-    // ~0.15 bit por pixel por quadro: 4K30 ≈ 37 Mbps, 1080p30 ≈ 9 Mbps (mín. 10)
-    var bps = Math.round(st.w * st.h * Math.max(24, st.fps) * 0.15);
-    return Math.max(10000000, Math.min(bps, 60000000));
+    // ~0.25 bit por pixel por quadro: 1080p30 ≈ 16 Mbps, 3264×1836@20 ≈ 30 Mbps, 4K30 ≈ 60 Mbps
+    var bps = Math.round(st.w * st.h * Math.max(24, st.fps) * 0.25);
+    return Math.max(16000000, Math.min(bps, 60000000));
   }
 
   function stamp() {

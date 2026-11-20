@@ -1,5 +1,5 @@
 // Cache para funcionar offline no tablet (precache + cache em tempo de execução)
-var cacheName = 'tp-v5';
+var cacheName = 'tp-v6';
 var precache = [
   './',
   './index.html',
