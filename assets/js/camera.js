@@ -77,6 +77,17 @@
       applyOpacity();
     });
 
+    el.meter = $('cam-meter-bar');
+    el.audio = $('cam-audio');
+    el.audio.value = audio.mode;
+    el.audio.addEventListener('change', function () {
+      audio.mode = el.audio.value; save('tp_cam_audio', audio.mode);
+      if (!state.stream || state.recorder) { return; }
+      var mic = state.stream.getAudioTracks()[0];
+      var p = mic ? mic.applyConstraints({ noiseSuppression: audio.mode === 'radio', echoCancellation: false, autoGainControl: false }).catch(function () {}) : Promise.resolve();
+      p.then(function () { buildAudio(state.stream); showInfo(); });
+    });
+
     el.fps30 = $('cam-fps30');
     el.fps30.checked = fps.on;
     el.fps30.addEventListener('change', function () {
@@ -98,21 +109,139 @@
   function stopTracks() {
     if (state.stream) { state.stream.getTracks().forEach(function (t) { t.stop(); }); }
     state.stream = null;
+    teardownAudio();
   }
 
-  var AUDIO_HQ = {
-    echoCancellation: false,
-    noiseSuppression: false,
-    autoGainControl: false,
-    sampleRate: { ideal: 48000 },
-    sampleSize: { ideal: 16 },
-    channelCount: { ideal: 2 }
-  };
+  /**
+   * Áudio
+   * 'radio'   = voz de rádio: redução de ruído do Android + filtro de graves, corte de "embolado",
+   *             presença, compressor, ganho e limitador (voz alta, clara e sem estourar)
+   * 'natural' = microfone sem redução de ruído, só filtro de graves, compressão leve e limitador
+   */
+  var audio = { mode: load('tp_cam_audio', 'radio'), ctx: null, nodes: null, track: null, meterTimer: null };
+  if (audio.mode !== 'radio' && audio.mode !== 'natural') { audio.mode = 'radio'; }
+
+  function audioConstraints() {
+    var ns = audio.mode === 'radio';
+    return {
+      echoCancellation: false,
+      noiseSuppression: ns,
+      autoGainControl: false,
+      sampleRate: { ideal: 48000 },
+      channelCount: { ideal: 1 }
+    };
+  }
+
+  function getAudioCtx() {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) { return null; }
+    if (!audio.ctx || audio.ctx.state === 'closed') {
+      try { audio.ctx = new AC({ sampleRate: 48000, latencyHint: 'interactive' }); } catch (e) { audio.ctx = new AC(); }
+    }
+    if (audio.ctx.state === 'suspended') { audio.ctx.resume(); }
+    return audio.ctx;
+  }
+
+  function biquad(ctx, type, freq, gain, q) {
+    var f = ctx.createBiquadFilter();
+    f.type = type; f.frequency.value = freq;
+    if (gain !== undefined) { f.gain.value = gain; }
+    if (q !== undefined) { f.Q.value = q; }
+    return f;
+  }
+
+  function compressor(ctx, threshold, ratio, attack, release, knee) {
+    var c = ctx.createDynamicsCompressor();
+    c.threshold.value = threshold; c.ratio.value = ratio;
+    c.attack.value = attack; c.release.value = release; c.knee.value = knee;
+    return c;
+  }
+
+  function teardownAudio() {
+    if (audio.meterTimer) { clearInterval(audio.meterTimer); audio.meterTimer = null; }
+    if (audio.nodes) { audio.nodes.forEach(function (n) { try { n.disconnect(); } catch (e) {} }); }
+    audio.nodes = null;
+    if (audio.track) { try { audio.track.stop(); } catch (e) {} }
+    audio.track = null;
+    if (el.meter) { el.meter.style.width = '0%'; }
+  }
+
+  // Monta a cadeia de tratamento de voz e devolve a faixa de áudio processada
+  function buildAudio(stream) {
+    teardownAudio();
+    var mic = stream.getAudioTracks()[0];
+    var ctx = mic && getAudioCtx();
+    if (!ctx) { return mic || null; }
+
+    var src = ctx.createMediaStreamSource(new MediaStream([mic]));
+    var chain;
+    if (audio.mode === 'radio') {
+      // mesma receita do VOZ_RADIO do editor de vídeo
+      var pre = ctx.createGain(); pre.gain.value = 0.5;  // -6 dB: o microfone do tablet chega quente demais
+      var makeup = ctx.createGain(); makeup.gain.value = 1.6; // +4 dB
+      chain = [
+        pre,
+        biquad(ctx, 'highpass', 90, undefined, 0.7),     // tira ronco/batida na mesa
+        biquad(ctx, 'peaking', 200, -3, 1.4),            // tira o "embolado"
+        biquad(ctx, 'peaking', 420, -3.5, 1.2),          // tira som de caixa/sala
+        biquad(ctx, 'peaking', 2600, 5, 1.2),            // presença
+        biquad(ctx, 'peaking', 4500, 3, 1.4),            // clareza
+        biquad(ctx, 'highshelf', 7500, 4),               // brilho de rádio
+        compressor(ctx, -21, 4, 0.005, 0.08, 6),         // segura a dinâmica
+        makeup,
+        compressor(ctx, -1.5, 20, 0.001, 0.05, 0)        // limitador: nunca estoura
+      ];
+    } else {
+      var preN = ctx.createGain(); preN.gain.value = 0.6;
+      chain = [
+        preN,
+        biquad(ctx, 'highpass', 80, undefined, 0.7),
+        biquad(ctx, 'peaking', 250, -2, 1.2),
+        compressor(ctx, -20, 2.5, 0.01, 0.2, 10),
+        compressor(ctx, -1.5, 20, 0.001, 0.05, 0)
+      ];
+    }
+
+    var analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    var dest = ctx.createMediaStreamDestination();
+    dest.channelCount = 1;
+
+    var prev = src;
+    chain.forEach(function (n) { prev.connect(n); prev = n; });
+    prev.connect(analyser);
+    prev.connect(dest);
+
+    audio.nodes = [src].concat(chain, [analyser, dest]);
+    audio.track = dest.stream.getAudioTracks()[0];
+
+    // medidor de nível
+    var buf = new Float32Array(analyser.fftSize);
+    audio.meterTimer = setInterval(function () {
+      if (!el.meter) { return; }
+      analyser.getFloatTimeDomainData(buf);
+      var peak = 0;
+      for (var i = 0; i < buf.length; i++) { var a = Math.abs(buf[i]); if (a > peak) { peak = a; } }
+      var db = 20 * Math.log10(peak || 1e-6);
+      var pct = Math.max(0, Math.min(100, (db + 50) * 2));
+      el.meter.style.width = pct + '%';
+      el.meter.style.background = db > -3 ? '#e33' : db > -12 ? '#fc3' : '#3c6';
+    }, 80);
+
+    return audio.track;
+  }
+
+  // Stream que vai para o gravador: vídeo da câmera + áudio tratado
+  function recordStream() {
+    var v = state.stream.getVideoTracks();
+    var a = audio.track ? [audio.track] : state.stream.getAudioTracks();
+    return new MediaStream(v.concat(a));
+  }
 
   function getMedia() {
     var big = MODES[state.res].list[0];
     var v = { facingMode: state.facing, width: { ideal: big[0] }, height: { ideal: big[1] }, frameRate: { ideal: 30 } };
-    return navigator.mediaDevices.getUserMedia({ video: v, audio: AUDIO_HQ }).catch(function () {
+    return navigator.mediaDevices.getUserMedia({ video: v, audio: audioConstraints() }).catch(function () {
       return navigator.mediaDevices.getUserMedia({ video: v, audio: true });
     }).catch(function () {
       return navigator.mediaDevices.getUserMedia({ video: { facingMode: state.facing }, audio: true });
@@ -179,6 +308,7 @@
       try { vt.contentHint = 'detail'; } catch (e) {}
       return pickBestMode(vt);
     }).then(function () {
+      buildAudio(state.stream);
       el.video.srcObject = state.stream;
       el.video.classList.toggle('mirror', state.facing === 'user');
       document.body.classList.add('cam-on');
@@ -386,9 +516,9 @@
       if (mime) { opts.mimeType = mime; }
 
       try {
-        state.recorder = new MediaRecorder(state.stream, opts);
+        state.recorder = new MediaRecorder(recordStream(), opts);
       } catch (e) {
-        state.recorder = new MediaRecorder(state.stream);
+        state.recorder = new MediaRecorder(recordStream());
       }
 
       state.writer = disk;
@@ -483,7 +613,7 @@
   }
 
   // Expõe estado para diagnóstico
-  window.TPCam = { state: state, fps: fps, start: startCamera, stop: stopCamera, rec: startRecording, stopRec: stopRecording };
+  window.TPCam = { state: state, fps: fps, audio: audio, start: startCamera, stop: stopCamera, rec: startRecording, stopRec: stopRecording };
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
